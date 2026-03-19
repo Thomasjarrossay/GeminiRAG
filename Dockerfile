@@ -19,8 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Create data directories
-RUN mkdir -p data/videos data/images data/texts uploads_temp
+# Create data directories (chroma persist dir inclus)
+RUN mkdir -p data/videos data/images data/texts data/chroma uploads_temp
 
 EXPOSE 8000
 

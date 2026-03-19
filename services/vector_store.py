@@ -1,13 +1,13 @@
 """
-Qdrant Vector Store — Gestion de la base vectorielle
+Chroma Vector Store — Gestion de la base vectorielle
 =====================================================
-Compatible Qdrant Cloud et Qdrant local (localhost:6333).
+Base embarquée dans le container Docker — aucun service externe requis.
+Persistance via volume Docker monté sur /app/data/chroma.
 
-Variables .env requises :
-  QDRANT_URL       : URL du cluster Qdrant
-  QDRANT_API_KEY   : Clé API (optionnelle pour local)
-  QDRANT_COLLECTION: Nom de la collection
-  EMBEDDING_DIM    : Dimension des vecteurs (768 par défaut)
+Variables .env utilisées :
+  CHROMA_PATH    : Chemin de persistance (défaut: /app/data/chroma)
+  CHROMA_COLLECTION: Nom de la collection (défaut: geminirag)
+  EMBEDDING_DIM  : Dimension des vecteurs (768 par défaut, info only)
 """
 
 import os
@@ -15,48 +15,36 @@ import logging
 import uuid
 from typing import Optional
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-    SearchRequest,
-)
+import chromadb
+from chromadb.config import Settings
 
 logger = logging.getLogger(__name__)
 
 
 class QdrantStore:
-    """Interface haut niveau pour Qdrant."""
+    """
+    Interface haut niveau pour Chroma.
+    Conserve le nom QdrantStore pour compatibilité avec le reste du code.
+    """
 
     def __init__(self):
-        url = os.getenv("QDRANT_URL", "http://localhost:6333")
-        api_key = os.getenv("QDRANT_API_KEY") or None
-        self.collection = os.getenv("QDRANT_COLLECTION", "geminirag")
+        chroma_path = os.getenv("CHROMA_PATH", "/app/data/chroma")
+        self.collection_name = os.getenv("CHROMA_COLLECTION", os.getenv("QDRANT_COLLECTION", "geminirag"))
         self.dim = int(os.getenv("EMBEDDING_DIM", "768"))
 
-        self.client = QdrantClient(url=url, api_key=api_key, timeout=30)
-        logger.info(f"Qdrant connecté : {url} | collection: {self.collection}")
+        os.makedirs(chroma_path, exist_ok=True)
 
-        self._ensure_collection()
+        self.client = chromadb.PersistentClient(
+            path=chroma_path,
+            settings=Settings(anonymized_telemetry=False),
+        )
 
-    def _ensure_collection(self):
-        """Crée la collection si elle n'existe pas."""
-        existing = [c.name for c in self.client.get_collections().collections]
-        if self.collection not in existing:
-            self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=VectorParams(
-                    size=self.dim,
-                    distance=Distance.COSINE,  # Gemini → cosine similarity
-                ),
-            )
-            logger.info(f"Collection '{self.collection}' créée (dim={self.dim})")
-        else:
-            logger.info(f"Collection '{self.collection}' déjà existante")
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},  # Gemini → cosine similarity
+        )
+
+        logger.info(f"Chroma initialisé | path: {chroma_path} | collection: {self.collection_name}")
 
     def upsert(self, points: list[dict]) -> int:
         """
@@ -67,32 +55,41 @@ class QdrantStore:
             "id": str (uuid optionnel),
             "vector": list[float],
             "payload": {
-                "content": str,       # texte/description
-                "source_file": str,   # nom du fichier source
-                "file_type": str,     # "text" | "image" | "video"
-                "chunk_index": int,   # index du chunk dans le fichier
-                "metadata": dict,     # métadonnées supplémentaires
+                "content": str,
+                "source_file": str,
+                "file_type": str,     # "text" | "image" | "video" | "pdf"
+                "chunk_index": int,
+                "metadata": dict,
             }
         }
         """
-        qdrant_points = []
+        ids = []
+        embeddings = []
+        documents = []
+        metadatas = []
+
         for p in points:
             point_id = p.get("id") or str(uuid.uuid4())
-            # Qdrant accepte les UUIDs comme string
-            qdrant_points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=p["vector"],
-                    payload=p.get("payload", {}),
-                )
-            )
+            payload = p.get("payload", {})
 
-        self.client.upsert(
-            collection_name=self.collection,
-            points=qdrant_points,
+            ids.append(point_id)
+            embeddings.append(p["vector"])
+            documents.append(payload.get("content", ""))
+            metadatas.append({
+                "source_file": payload.get("source_file", ""),
+                "file_type": payload.get("file_type", ""),
+                "chunk_index": payload.get("chunk_index", 0),
+            })
+
+        self.collection.upsert(
+            ids=ids,
+            embeddings=embeddings,
+            documents=documents,
+            metadatas=metadatas,
         )
-        logger.info(f"{len(qdrant_points)} points insérés dans '{self.collection}'")
-        return len(qdrant_points)
+
+        logger.info(f"{len(ids)} points insérés dans '{self.collection_name}'")
+        return len(ids)
 
     def search(
         self,
@@ -106,54 +103,54 @@ class QdrantStore:
         Returns:
             Liste de dicts {score, content, source_file, file_type, metadata}
         """
-        query_filter = None
-        if file_type_filter:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="file_type",
-                        match=MatchValue(value=file_type_filter),
-                    )
-                ]
-            )
+        where = {"file_type": file_type_filter} if file_type_filter else None
 
-        results = self.client.search(
-            collection_name=self.collection,
-            query_vector=query_vector,
-            limit=limit,
-            query_filter=query_filter,
-            with_payload=True,
+        results = self.collection.query(
+            query_embeddings=[query_vector],
+            n_results=min(limit, max(self.collection.count(), 1)),
+            where=where,
+            include=["documents", "metadatas", "distances"],
         )
 
-        return [
-            {
-                "score": r.score,
-                "content": r.payload.get("content", ""),
-                "source_file": r.payload.get("source_file", ""),
-                "file_type": r.payload.get("file_type", ""),
-                "chunk_index": r.payload.get("chunk_index", 0),
-                "metadata": r.payload.get("metadata", {}),
-            }
-            for r in results
-        ]
+        output = []
+        if not results["ids"] or not results["ids"][0]:
+            return output
+
+        for i, doc_id in enumerate(results["ids"][0]):
+            distance = results["distances"][0][i]
+            # Chroma cosine distance : 0 = identique, 2 = opposé
+            # Convertir en score de similarité [0, 1]
+            score = 1 - (distance / 2)
+            meta = results["metadatas"][0][i] if results["metadatas"] else {}
+            output.append({
+                "score": round(score, 4),
+                "content": results["documents"][0][i] if results["documents"] else "",
+                "source_file": meta.get("source_file", ""),
+                "file_type": meta.get("file_type", ""),
+                "chunk_index": meta.get("chunk_index", 0),
+                "metadata": {},
+            })
+
+        return output
 
     def list_documents(self) -> list[dict]:
         """Liste les documents indexés (groupés par source_file)."""
-        # Scroll sur tous les points pour récupérer les fichiers uniques
-        points, _ = self.client.scroll(
-            collection_name=self.collection,
-            limit=1000,
-            with_payload=True,
-            with_vectors=False,
+        total = self.collection.count()
+        if total == 0:
+            return []
+
+        results = self.collection.get(
+            include=["metadatas"],
+            limit=10000,
         )
 
         docs = {}
-        for p in points:
-            src = p.payload.get("source_file", "unknown")
+        for meta in results.get("metadatas", []):
+            src = meta.get("source_file", "unknown")
             if src not in docs:
                 docs[src] = {
                     "source_file": src,
-                    "file_type": p.payload.get("file_type", ""),
+                    "file_type": meta.get("file_type", ""),
                     "chunk_count": 0,
                 }
             docs[src]["chunk_count"] += 1
@@ -162,21 +159,16 @@ class QdrantStore:
 
     def delete_document(self, source_file: str) -> int:
         """Supprime tous les points d'un fichier source."""
-        result = self.client.delete(
-            collection_name=self.collection,
-            points_selector=Filter(
-                must=[
-                    FieldCondition(
-                        key="source_file",
-                        match=MatchValue(value=source_file),
-                    )
-                ]
-            ),
+        results = self.collection.get(
+            where={"source_file": source_file},
+            include=[],
         )
-        logger.info(f"Document '{source_file}' supprimé")
-        return 1
+        ids_to_delete = results.get("ids", [])
+        if ids_to_delete:
+            self.collection.delete(ids=ids_to_delete)
+        logger.info(f"Document '{source_file}' supprimé ({len(ids_to_delete)} chunks)")
+        return len(ids_to_delete)
 
     def count(self) -> int:
         """Retourne le nombre total de vecteurs indexés."""
-        info = self.client.get_collection(self.collection)
-        return info.points_count or 0
+        return self.collection.count()
