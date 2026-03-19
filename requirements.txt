@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════
+# GeminiRAG — Dépendances Python
+# Installation : pip install -r requirements.txt
+# Python 3.10+ recommandé
+# ═══════════════════════════════════════
+
+# API & Serveur
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+httpx>=0.26.0
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+
+# Google AI — Gemini Embedding 2
+google-generativeai>=0.8.0
+
+# Qdrant Vector Database
+qdrant-client>=1.8.0
+
+# Traitement multimodal
+# Vidéo : extraction de frames
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+
+# Images
+Pillow>=10.2.0
+
+# PDF
+pypdf>=4.1.0
+
+# Optionnel : traitement PDF avancé
+# pdfplumber>=0.10.0

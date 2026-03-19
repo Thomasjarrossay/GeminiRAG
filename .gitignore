@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+uploads_temp/
+data/videos/*
+data/images/*
+data/texts/*
+!data/videos/.gitkeep
+!data/images/.gitkeep
+!data/texts/.gitkeep
+.DS_Store
+*.log
